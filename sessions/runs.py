@@ -3,6 +3,7 @@ from enum import Enum
 import json
 
 from database import read_integer
+from evidence.intervals import Interval
 from registry.channels import normalize_channels, require_name
 
 
@@ -24,6 +25,16 @@ class Run:
     status: RunStatus
     sealed_end: int | None
     result_id: str | None
+
+
+@dataclass(frozen=True)
+class Switch:
+    run_id: int
+    cut_seq: int
+    new_condition: tuple[str, ...]
+    new_observer: str
+    new_first_seq: int
+    new_position: int
 
 
 def validate_position(position, label='source sequence'):
@@ -81,3 +92,61 @@ class RunStore:
         )
         if cursor.rowcount != 1:
             raise RuntimeError('run changed before sealing')
+
+
+class SwitchStore:
+    def __init__(self, db):
+        self.db = db
+
+    def insert(self, run_id, cut, new_condition, observer, first_seq):
+        self.db.execute(
+            'INSERT INTO run_switches(run_id, cut_seq, new_condition, new_observer, '
+            'new_first_seq) VALUES (?, ?, ?, ?, ?)',
+            (run_id, str(cut), json.dumps(new_condition), observer, str(first_seq)),
+        )
+
+    def for_run(self, run_id):
+        row = self.db.execute(
+            'SELECT * FROM run_switches WHERE run_id = ?', (str(run_id),)
+        ).fetchone()
+        if row is None:
+            return None
+        condition = json.loads(row['new_condition'])
+        if type(condition) is not list or tuple(condition) != normalize_channels(condition):
+            raise ValueError('invalid stored switch condition')
+        return Switch(
+            run_id, validate_position(read_integer(row['cut_seq']), 'cut sequence'),
+            tuple(condition), require_name(row['new_observer'], 'observer'),
+            validate_position(read_integer(row['new_first_seq']), 'first eligible sequence'),
+            validate_position(read_integer(row['new_position']), 'delivery position'),
+        )
+
+    def advance(self, run_id, previous, position):
+        if position != previous + 1:
+            raise ValueError('delivery position must advance one place')
+        cursor = self.db.execute(
+            "UPDATE run_switches SET new_position = ? "
+            "WHERE run_id = ? AND new_position = ?",
+            (str(position), run_id, str(previous)),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError('run changed before delivery could be acknowledged')
+
+
+class GapStore:
+    def __init__(self, db):
+        self.db = db
+
+    def remember(self, run_id, interval):
+        self.db.execute(
+            'INSERT OR IGNORE INTO history_gaps(run_id, lo, hi) VALUES (?, ?, ?)',
+            (run_id, str(interval.start), str(interval.end)),
+        )
+
+    def all_for(self, run_id):
+        rows = self.db.execute(
+            'SELECT lo, hi FROM history_gaps WHERE run_id = ? ORDER BY lo', (str(run_id),)
+        )
+        return tuple(
+            Interval(read_integer(row['lo']), read_integer(row['hi'])) for row in rows
+        )

@@ -36,8 +36,8 @@ class FrameLedger:
 
     def record(self, run_id, frame):
         previous = self.db.execute(
-            'SELECT channel, value FROM frames WHERE run_id = ? AND seq = ?',
-            (run_id, str(frame.seq)),
+            'SELECT channel, value FROM frames WHERE run_id = ? AND seq = ? AND observer = ?',
+            (run_id, str(frame.seq), frame.observer),
         ).fetchone()
         if previous is not None:
             if (previous['channel'], read_integer(previous['value'])) != (frame.channel, frame.value):

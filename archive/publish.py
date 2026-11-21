@@ -3,12 +3,16 @@ from dataclasses import dataclass
 from archive.artifacts import ArchiveArtifact, artifact_digest, encode_artifact
 from archive.eligibility import assess_seal
 from archive.results import ResultStore, StoredResult, result_id_for
+from archive.switch_artifacts import (
+    SwitchArchiveArtifact, encode_switch_artifact, switch_artifact_digest, switch_quality,
+)
+from archive.switch_eligibility import assess_switch_seal
 from database import transaction
 from evidence.intervals import Interval, validate_interval
 from quality.evaluation import evaluate_shift
 from registry.calibrations import RevisionCatalog
 from sessions.closing import finish_run, release_observer, sealed_result_for
-from sessions.runs import RunStore
+from sessions.runs import RunStore, SwitchStore
 
 
 @dataclass(frozen=True)
@@ -16,6 +20,13 @@ class SealOutcome:
     result_id: str | None
     missing: tuple[Interval, ...] = ()
     release_error: str | None = None
+    unavailable: tuple[Interval, ...] = ()
+
+
+def _release(portal, handles):
+    errors = [message for handle in handles
+              if (message := release_observer(portal, handle)) is not None]
+    return '; '.join(errors) or None
 
 
 def seal(db, run_id, end, *, portal):
@@ -29,18 +40,43 @@ def seal(db, run_id, end, *, portal):
             if record is None or record.result_id != existing or record.end != end:
                 raise ValueError('published result is inconsistent with the sealed run')
             return SealOutcome(existing)
-        decision = assess_seal(db, run, end)
-        selection = decision.selection
-        if selection is None:
-            return SealOutcome(None, decision.missing)
-        revision = RevisionCatalog(db).resolve(run.station, run.revision_id)
-        quality = evaluate_shift(selection.frames, revision, run.condition)
-        result_id = result_id_for(run_id)
-        artifact = ArchiveArtifact(
-            result_id, run_id, run.station, selection.interval, run.condition, run.observer,
-            run.first_seq, revision, selection.frames, selection.receipts, selection.no_match, quality,
-        )
-        payload = encode_artifact(artifact)
-        results.insert(StoredResult(result_id, run_id, end, payload, artifact_digest(payload)))
-        finish_run(db, run, end, result_id)
-    return SealOutcome(result_id, release_error=release_observer(portal, run.observer))
+        switch_record = SwitchStore(db).for_run(run_id)
+        if switch_record is None:
+            decision = assess_seal(db, run, end)
+            selection = decision.selection
+            if selection is None:
+                return SealOutcome(None, decision.missing)
+            revision = RevisionCatalog(db).resolve(run.station, run.revision_id)
+            result_id = result_id_for(run_id)
+            artifact = ArchiveArtifact(
+                result_id, run_id, run.station, selection.interval, run.condition, run.observer,
+                run.first_seq, revision, selection.frames, selection.receipts,
+                selection.no_match, evaluate_shift(selection.frames, revision, run.condition),
+            )
+            payload = encode_artifact(artifact)
+            results.insert(StoredResult(result_id, run_id, end, payload, artifact_digest(payload)))
+            finish_run(db, run, end, result_id)
+            handles = (run.observer,)
+        else:
+            decision = assess_switch_seal(db, portal, run, end)
+            if decision.selection is None:
+                return SealOutcome(None, decision.missing, unavailable=decision.unavailable)
+            selection = decision.selection
+            revision = RevisionCatalog(db).resolve(run.station, run.revision_id)
+            result_id = result_id_for(run_id)
+            quality = switch_quality(
+                selection.frames, revision, selection.cut,
+                run.condition, switch_record.new_condition,
+            )
+            artifact = SwitchArchiveArtifact(
+                result_id, run_id, run.station, selection.interval, selection.cut,
+                run.condition, switch_record.new_condition, revision,
+                selection.frames, selection.receipts, selection.no_match, quality,
+            )
+            payload = encode_switch_artifact(artifact)
+            results.insert(StoredResult(
+                result_id, run_id, end, payload, switch_artifact_digest(payload),
+            ))
+            finish_run(db, run, end, result_id)
+            handles = (run.observer, switch_record.new_observer)
+    return SealOutcome(result_id, release_error=_release(portal, handles))

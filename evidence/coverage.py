@@ -1,30 +1,12 @@
-from dataclasses import dataclass
-
 from database import transaction
 from evidence.frames import FrameLedger
 from evidence.intake import CaptureContext
-from evidence.intervals import (
-    Interval, intersect_interval, normalize_intervals, subtract_intervals, validate_interval,
-)
+from evidence.intervals import Interval, intersect_interval, normalize_intervals, validate_interval
 from evidence.receipts import ReceiptLedger, receipt_order
-from sessions.runs import RunStore
-
-
-@dataclass(frozen=True)
-class CoverageReport:
-    proven: tuple[Interval, ...]
-    missing: tuple[Interval, ...]
-    no_match: tuple[Interval, ...]
-
-
-def inspect_coverage(interval, frames, receipts):
-    validate_interval(interval)
-    fragments = (intersect_interval(interval, receipt.interval) for receipt in receipts)
-    proven = normalize_intervals(fragment for fragment in fragments if fragment is not None)
-    occupied = (Interval(frame.seq, frame.seq + 1) for frame in frames)
-    return CoverageReport(
-        proven, subtract_intervals((interval,), proven), subtract_intervals(proven, occupied),
-    )
+from evidence.switching import (
+    CoverageReport, assess_side, inspect_coverage, windowed_side_views,
+)
+from sessions.runs import RunStore, SwitchStore
 
 
 def validate_selection(context, interval, frames, receipts):
@@ -54,7 +36,25 @@ def coverage(db, run_id, start, end):
     interval = validate_interval(Interval(start, end))
     with transaction(db):
         run = RunStore(db).load(run_id)
+        switch_record = SwitchStore(db).for_run(run_id)
         frames = FrameLedger(db).in_range(run_id, interval)
         receipts = ReceiptLedger(db).intersecting(run_id, interval)
-        validate_selection(CaptureContext.from_run(run), interval, frames, receipts)
-        return inspect_coverage(interval, frames, receipts)
+        if switch_record is None:
+            validate_selection(CaptureContext.from_run(run), interval, frames, receipts)
+            return inspect_coverage(interval, frames, receipts)
+        if interval.start < run.start_seq:
+            raise ValueError('target interval precedes run start')
+        limited = windowed_side_views(run, switch_record, start, end)
+        sides = tuple(assess_side(view, frames, receipts) for view in limited)
+        proven = normalize_intervals(tuple(
+            fragment for side in sides
+            for fragment in (intersect_interval(side.view.interval, receipt.interval)
+                             for receipt in side.receipts) if fragment is not None
+        ))
+        missing = normalize_intervals(tuple(
+            piece for side in sides for piece in side.missing
+        ))
+        no_match = normalize_intervals(tuple(
+            piece for side in sides for piece in side.no_match
+        ))
+        return CoverageReport(proven, missing, no_match)

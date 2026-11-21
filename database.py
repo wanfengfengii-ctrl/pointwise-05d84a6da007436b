@@ -42,7 +42,21 @@ CREATE TABLE IF NOT EXISTS frames (
     value TEXT NOT NULL,
     observer TEXT NOT NULL,
     provenance TEXT NOT NULL,
-    PRIMARY KEY (run_id, seq)
+    PRIMARY KEY (run_id, seq, observer)
+);
+CREATE TABLE IF NOT EXISTS run_switches (
+    run_id INTEGER PRIMARY KEY REFERENCES runs(run_id),
+    cut_seq TEXT NOT NULL,
+    new_condition TEXT NOT NULL,
+    new_observer TEXT NOT NULL,
+    new_first_seq TEXT NOT NULL,
+    new_position TEXT NOT NULL DEFAULT '0'
+);
+CREATE TABLE IF NOT EXISTS history_gaps (
+    run_id INTEGER NOT NULL REFERENCES runs(run_id),
+    lo TEXT NOT NULL,
+    hi TEXT NOT NULL,
+    PRIMARY KEY (run_id, lo, hi)
 );
 CREATE TABLE IF NOT EXISTS receipts (
     run_id INTEGER NOT NULL REFERENCES runs(run_id),
